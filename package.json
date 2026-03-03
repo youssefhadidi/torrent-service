@@ -1,0 +1,19 @@
+{
+  "name": "torrent-service",
+  "version": "1.0.0",
+  "description": "Standalone WebTorrent microservice — REST API + WebSocket events",
+  "type": "module",
+  "private": true,
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs",
+    "dev": "node --watch index.mjs"
+  },
+  "dependencies": {
+    "webtorrent": "^2.8.5",
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
