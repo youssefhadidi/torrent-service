@@ -7,7 +7,8 @@
   "main": "index.mjs",
   "scripts": {
     "start": "node index.mjs",
-    "dev": "node --watch index.mjs"
+    "dev": "node --watch index.mjs",
+    "rebuild-native": "node -e \"const{execSync}=require('child_process'),path=require('path'),dir=path.dirname(require.resolve('node-datachannel/package.json'));execSync('node node_modules/.bin/prebuild-install -r napi',{cwd:dir,stdio:'inherit'})\""
   },
   "dependencies": {
     "webtorrent": "^2.8.5",
@@ -15,5 +16,11 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "pnpm": {
+    "trustedDependencies": [
+      "node-datachannel",
+      "utp-native"
+    ]
   }
 }

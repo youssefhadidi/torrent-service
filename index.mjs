@@ -202,8 +202,6 @@ function setupTorrentListeners(torrent, gid) {
   });
 
   torrent.on('done', async () => {
-    if (torrent.progress < 1.0) return;
-
     log.info('Download completed', { gid, name: torrent.name });
     const interval = progressIntervals.get(gid);
     if (interval) { clearInterval(interval); progressIntervals.delete(gid); }
