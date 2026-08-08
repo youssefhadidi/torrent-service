@@ -9,31 +9,42 @@
  *   POST   /downloads              Add a download (magnet link or file:// URL)
  *   GET    /downloads/active       List active (non-paused) downloads [?path=]
  *   GET    /downloads/waiting      List paused/waiting downloads [?offset=&num=&path=]
+ *   GET    /downloads/completed    List finished downloads kept as history [?path=]
+ *   DELETE /downloads/completed    Dismiss the whole completed history
  *   GET    /downloads/:gid         Get status of a specific download
  *   PATCH  /downloads/:gid         Pause or resume { action: 'pause'|'resume' }
  *   DELETE /downloads/:gid         Remove a download
  *   GET    /tracker/test           Test tracker connectivity [?url=]
  *
+ * A finished download is kept in a bounded history (see COMPLETED_HISTORY) rather
+ * than forgotten: the clients that care about a completion are not necessarily
+ * connected at the moment it happens. Dismissing a completed entry never touches
+ * the files it produced — removing an UNFINISHED download does delete its partial
+ * data, which is useless once the torrent is gone.
+ *
  * WebSocket:
  *   ws://host:PORT/events          Push events to connected clients
  *   Event format: { type, payload }
- *   Types: download-progress, download-complete, download-paused, download-resumed
+ *   Types: download-progress, download-complete, download-paused, download-resumed,
+ *          download-removed, downloads-status (state snapshot sent on connect)
  *
  * Environment:
- *   TORRENT_SERVICE_PORT  Port to listen on (default: 9669)
- *   TORRENT_STATE_FILE    Path to persist download state (default: ./torrent-downloads.json)
+ *   TORRENT_SERVICE_PORT     Port to listen on (default: 9669)
+ *   TORRENT_STATE_FILE       Path to persist download state (default: ./torrent-downloads.json)
+ *   TORRENT_COMPLETED_HISTORY  How many finished downloads to keep (default: 100)
  */
 
 import http from 'http';
 import https from 'https';
-import { readFile, writeFile } from 'fs/promises';
+import { readFile, writeFile, rm } from 'fs/promises';
 import { existsSync } from 'fs';
-import { resolve } from 'path';
+import { resolve, sep } from 'path';
 import { WebSocketServer } from 'ws';
 import WebTorrent from 'webtorrent';
 
 const PORT = parseInt(process.env.TORRENT_SERVICE_PORT || '9669', 10);
 const STATE_FILE = process.env.TORRENT_STATE_FILE || resolve(process.cwd(), './torrent-downloads.json');
+const COMPLETED_HISTORY = parseInt(process.env.TORRENT_COMPLETED_HISTORY || '100', 10);
 
 // --- Logger ---
 const log = {
@@ -55,9 +66,10 @@ function broadcast(event) {
 
 // --- State ---
 let client = null;
-const pausedDownloads = new Map();   // gid → torrentInfo (for downloads removed from WebTorrent)
-const progressIntervals = new Map(); // gid → intervalId
-const downloadMeta = new Map();      // gid → { url, dir, relativePath, addedAt }
+const pausedDownloads = new Map();    // gid → torrentInfo (for downloads removed from WebTorrent)
+const progressIntervals = new Map();  // gid → intervalId
+const downloadMeta = new Map();       // gid → { url, dir, relativePath, addedAt }
+const completedDownloads = new Map(); // gid → completed record, oldest first (see rememberCompleted)
 
 // --- WebTorrent client ---
 function ensureClient() {
@@ -114,6 +126,35 @@ function formatTorrentInfo(torrent) {
   };
 }
 
+/**
+ * Snapshot a finished torrent for the history.
+ *
+ * Taken while the torrent is still in the client: once it is removed its stats
+ * are gone, and the completion event itself only carries a gid.
+ */
+function toCompletedRecord(info, relativePath) {
+  return {
+    ...info,
+    status: 'complete',
+    progress: 100,
+    downloadSpeed: '0 B/s',
+    uploadSpeed: '0 B/s',
+    seeders: 0,
+    peers: 0,
+    path: relativePath,
+    completedAt: new Date().toISOString(),
+  };
+}
+
+/** Record a completion, evicting the oldest once the history is full. */
+function rememberCompleted(record) {
+  completedDownloads.delete(record.gid); // re-insert so the map stays oldest-first
+  completedDownloads.set(record.gid, record);
+  while (completedDownloads.size > COMPLETED_HISTORY) {
+    completedDownloads.delete(completedDownloads.keys().next().value);
+  }
+}
+
 function startProgressInterval(torrent, gid) {
   let lastLoggedPeers = -1;
   const interval = setInterval(() => {
@@ -153,7 +194,11 @@ async function saveDownloadState() {
       status: 'paused',
     }));
 
-    await writeFile(STATE_FILE, JSON.stringify([...active, ...paused], null, 2));
+    // Completed entries are stored whole: there is no torrent left to rebuild
+    // them from, so the record itself is the only copy.
+    const completed = Array.from(completedDownloads.values());
+
+    await writeFile(STATE_FILE, JSON.stringify([...active, ...paused, ...completed], null, 2));
   } catch (err) {
     log.error('Failed to save download state', { error: err.message });
   }
@@ -164,6 +209,11 @@ async function restoreDownloads() {
     if (!existsSync(STATE_FILE)) return;
     const saved = JSON.parse(await readFile(STATE_FILE, 'utf-8'));
     for (const entry of saved) {
+      // History rows: restored as-is, never handed back to WebTorrent.
+      if (entry.status === 'complete') {
+        if (entry.gid) rememberCompleted(entry);
+        continue;
+      }
       if (entry.status !== 'active' && entry.status !== 'paused') continue;
       log.info('Restoring torrent', { name: entry.name, gid: entry.gid, status: entry.status });
       await addDownload(entry.url, {
@@ -207,12 +257,17 @@ function setupTorrentListeners(torrent, gid) {
     if (interval) { clearInterval(interval); progressIntervals.delete(gid); }
 
     const completedRelativePath = downloadMeta.get(gid)?.relativePath || '';
+    const record = toCompletedRecord(formatTorrentInfo(torrent), completedRelativePath);
+    rememberCompleted(record);
     downloadMeta.delete(gid);
     await saveDownloadState();
 
-    broadcast({ type: 'download-complete', payload: { gid, targetPath: completedRelativePath } });
+    // The record travels with the event so a client that never saw the transfer
+    // can still name it; targetPath stays for consumers that only read that.
+    broadcast({ type: 'download-complete', payload: { ...record, targetPath: completedRelativePath } });
 
     torrent.removeAllListeners();
+    // destroyStore: false — the files are the whole point of the download.
     if (!torrent.destroyed) client.remove(torrent.infoHash, { destroyStore: false });
   });
 
@@ -322,10 +377,17 @@ function getWaitingDownloads(offset = 0, num = 100, filterPath = null) {
   return [...webTorrentPaused, ...pausedEntries].slice(offset, offset + num);
 }
 
+function getCompletedDownloads(filterPath = null) {
+  const entries = Array.from(completedDownloads.values());
+  if (filterPath == null) return entries;
+  return entries.filter((d) => (d.path || '') === filterPath);
+}
+
 function getDownloadStatus(gid) {
   const c = ensureClient();
   const torrent = c.torrents.find((t) => t.infoHash === gid);
-  return torrent ? formatTorrentInfo(torrent) : null;
+  if (torrent) return formatTorrentInfo(torrent);
+  return pausedDownloads.get(gid) || completedDownloads.get(gid) || null;
 }
 
 async function pauseDownload(gid) {
@@ -391,30 +453,91 @@ async function resumeDownload(gid) {
   return true;
 }
 
+/**
+ * Delete the partial data an unfinished download left behind.
+ *
+ * WebTorrent writes to `${dir}/${name}`, but a torrent name comes from the
+ * torrent itself, so the resolved path is checked to be strictly inside `dir`
+ * before anything is unlinked — a crafted name must not reach out of the
+ * download folder.
+ */
+async function deletePartialData(gid, name) {
+  const dir = downloadMeta.get(gid)?.dir;
+  if (!dir || !name) return false;
+
+  const base = resolve(dir);
+  const target = resolve(base, name);
+  if (target === base || !target.startsWith(base + sep)) {
+    log.warn('Refusing to delete outside the download folder', { gid, name });
+    return false;
+  }
+
+  try {
+    await rm(target, { recursive: true, force: true });
+    log.info('Deleted partial download data', { gid, target });
+    return true;
+  } catch (err) {
+    log.warn('Failed to delete partial download data', { gid, target, error: err.message });
+    return false;
+  }
+}
+
+/**
+ * Remove a download.
+ *
+ * A finished download is only a history row, so dismissing it leaves the files
+ * it produced alone. An unfinished one is deleted along with its partial data:
+ * a half-downloaded torrent store is unusable once the torrent is gone.
+ */
 async function removeDownload(gid) {
+  if (completedDownloads.has(gid)) {
+    completedDownloads.delete(gid);
+    downloadMeta.delete(gid);
+    await saveDownloadState();
+    log.info('Completed download dismissed, files kept', { gid });
+    return { success: true, filesDeleted: false };
+  }
+
   const c = ensureClient();
   const torrent = c.torrents.find((t) => t.infoHash === gid);
 
+  // A paused download has already left the client, so its partial data has to be
+  // unlinked by path rather than through the torrent's own store.
   if (!torrent) {
-    if (pausedDownloads.has(gid)) {
-      pausedDownloads.delete(gid);
-      downloadMeta.delete(gid);
-      await saveDownloadState();
-      return true;
-    }
-    throw new Error(`Download not found: ${gid}`);
+    if (!pausedDownloads.has(gid)) throw new Error(`Download not found: ${gid}`);
+    const filesDeleted = await deletePartialData(gid, pausedDownloads.get(gid)?.name);
+    pausedDownloads.delete(gid);
+    downloadMeta.delete(gid);
+    await saveDownloadState();
+    log.info('Paused download removed', { gid, filesDeleted });
+    return { success: true, filesDeleted };
   }
 
   const interval = progressIntervals.get(gid);
   if (interval) { clearInterval(interval); progressIntervals.delete(gid); }
 
   if (!torrent.destroyed) torrent.removeAllListeners();
-  c.remove(gid);
+  c.remove(gid, { destroyStore: true });
   downloadMeta.delete(gid);
   await saveDownloadState();
 
-  log.info('Download removed', { gid });
-  return true;
+  log.info('Download removed', { gid, filesDeleted: true });
+  return { success: true, filesDeleted: true };
+}
+
+/** Dismiss the whole history. Files are never touched — see removeDownload. */
+async function clearCompletedDownloads() {
+  const gids = Array.from(completedDownloads.keys());
+  completedDownloads.clear();
+  for (const gid of gids) downloadMeta.delete(gid);
+  await saveDownloadState();
+
+  // Reuses the per-download event clients already handle, so a cleared history
+  // disappears everywhere without a bespoke message type.
+  for (const gid of gids) broadcast({ type: 'download-removed', payload: { gid } });
+
+  log.info('Cleared completed downloads', { count: gids.length });
+  return gids.length;
 }
 
 async function testTrackerConnectivity(trackerUrl) {
@@ -496,6 +619,19 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, getWaitingDownloads(offset, num, filterPath));
     }
 
+    // GET /downloads/completed — must precede the /downloads/:gid match below,
+    // which would otherwise treat "completed" as a gid.
+    if (method === 'GET' && pathname === '/downloads/completed') {
+      const filterPath = url.searchParams.has('path') ? url.searchParams.get('path') : null;
+      return sendJson(res, 200, getCompletedDownloads(filterPath));
+    }
+
+    // DELETE /downloads/completed — same ordering constraint as the GET above.
+    if (method === 'DELETE' && pathname === '/downloads/completed') {
+      const cleared = await clearCompletedDownloads();
+      return sendJson(res, 200, { success: true, cleared });
+    }
+
     // GET /tracker/test
     if (method === 'GET' && pathname === '/tracker/test') {
       const trackerUrl = url.searchParams.get('url');
@@ -523,8 +659,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (method === 'DELETE') {
-        await removeDownload(gid);
-        return sendJson(res, 200, { success: true });
+        return sendJson(res, 200, await removeDownload(gid));
       }
     }
 
@@ -546,6 +681,22 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws) => {
+  // This service is the only holder of download state and otherwise says nothing
+  // until the next progress tick, so a client that connects — including the main
+  // app's bridge after a restart or a reconnect — is handed the current picture
+  // straight away instead of inferring it from whatever happens next.
+  try {
+    ws.send(JSON.stringify({
+      type: 'downloads-status',
+      payload: {
+        downloads: [...getActiveDownloads(), ...getWaitingDownloads(), ...getCompletedDownloads()],
+        timestamp: new Date().toISOString(),
+      },
+    }));
+  } catch (err) {
+    log.warn('Failed to send state snapshot to new WebSocket client', { error: err.message });
+  }
+
   ws.on('close', () => log.info('WebSocket client disconnected'));
 });
 
