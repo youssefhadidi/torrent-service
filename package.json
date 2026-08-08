@@ -17,8 +17,12 @@
   "engines": {
     "node": ">=18"
   },
+  "trustedDependencies": [
+    "node-datachannel",
+    "utp-native"
+  ],
   "pnpm": {
-    "trustedDependencies": [
+    "onlyBuiltDependencies": [
       "node-datachannel",
       "utp-native"
     ]
